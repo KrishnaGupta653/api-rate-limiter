@@ -22,10 +22,10 @@ app = Flask(__name__)
 CORS(app, origins=["*"])
 
 # Simple Configuration
-BACKEND_URL = os.getenv('BACKEND_URL', 'https://httpbin.org')
-REQUESTS_PER_HOUR = int(os.getenv('REQUESTS_PER_HOUR', '60'))
-DDOS_REQUESTS_PER_MINUTE = int(os.getenv('DDOS_REQUESTS_PER_MINUTE', '20'))
-BLOCK_DURATION_MINUTES = int(os.getenv('BLOCK_DURATION_MINUTES', '60'))
+BACKEND_URL = os.getenv('BACKEND_URL')
+REQUESTS_PER_HOUR = int(os.getenv('REQUESTS_PER_HOUR'))
+DDOS_REQUESTS_PER_MINUTE = int(os.getenv('DDOS_REQUESTS_PER_MINUTE'))
+BLOCK_DURATION_MINUTES = int(os.getenv('BLOCK_DURATION_MINUTES'))
 
 # Data storage
 ip_requests = defaultdict(deque)  # IP -> list of request times
@@ -322,4 +322,4 @@ if __name__ == '__main__':
     print("="*50 + "\n")
     
     port = int(os.environ.get('PORT', 8080))
-
+    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
