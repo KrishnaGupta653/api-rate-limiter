@@ -322,7 +322,6 @@
 #     print("="*50 + "\n")
     
 #     port = int(os.environ.get('PORT', 8080))
-#     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
 
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
@@ -375,6 +374,7 @@ def cleanup_old_data():
     """Remove old request data"""
     current_time = time.time()
     one_hour_ago = current_time - 3600
+    one_minute_ago = current_time - 60
     
     # Clean hourly request data
     for ip in list(ip_requests.keys()):
@@ -394,29 +394,29 @@ def is_ip_blocked(ip):
     return ip in blocked_ips and blocked_ips[ip] > time.time()
 
 def check_rate_limit(ip):
-    """Check if IP exceeded rate limit - FIXED VERSION"""
+    """Check if IP exceeded rate limit"""
     current_time = time.time()
     
-    # Count requests in last minute BEFORE adding current request
+    # Add current request
+    ip_requests[ip].append(current_time)
+    
+    # Count requests in last hour
+    hour_count = len(ip_requests[ip])
+    
+    # Count requests in last minute (for DDoS detection)
     minute_requests = sum(1 for t in ip_requests[ip] if t > current_time - 60)
     
-    # Check DDoS FIRST (too many requests per minute)
+    # Check DDoS (too many requests per minute)
     if minute_requests >= DDOS_REQUESTS_PER_MINUTE:
         block_until = current_time + (BLOCK_DURATION_MINUTES * 60)
         blocked_ips[ip] = block_until
         logger.warning(f"🚨 BLOCKED IP {ip}: {minute_requests} requests/minute (DDoS)")
-        return False, minute_requests, "DDoS detected - IP blocked"
-    
-    # Add current request AFTER DDoS check
-    ip_requests[ip].append(current_time)
-    
-    # Count total requests in last hour
-    hour_count = len(ip_requests[ip])
+        return False, hour_count, "DDoS detected"
     
     # Check hourly rate limit
     if hour_count > REQUESTS_PER_HOUR:
         logger.warning(f"⚠️ RATE LIMITED IP {ip}: {hour_count}/{REQUESTS_PER_HOUR} requests/hour")
-        return False, hour_count, "Hourly rate limit exceeded"
+        return False, hour_count, "Rate limit exceeded"
     
     return True, hour_count, "OK"
 
@@ -431,32 +431,65 @@ def log_request(ip, method, path, status, details=""):
     
     logger.info(log_msg)
 
-@app.route('/')
-def home():
-    """Service information"""
-    return jsonify({
-        'service': 'API Rate Limiter',
-        'status': 'running',
-        'backend_url': BACKEND_URL,
-        'limits': {
-            'requests_per_hour': REQUESTS_PER_HOUR,
-            'ddos_threshold': f"{DDOS_REQUESTS_PER_MINUTE}/minute",
-            'block_duration': f"{BLOCK_DURATION_MINUTES} minutes"
-        },
-        'endpoints': {
-            'health': '/health',
-            'stats': '/stats',
-            'unblock': '/unblock/<ip>'
-        }
-    })
+def rate_limit_middleware():
+    """Apply rate limiting to all requests"""
+    ip = get_real_ip()
+    method = request.method
+    url_path = request.path
+    
+    # Clean old data periodically
+    cleanup_old_data()
+    
+    # Check if IP is blocked
+    if is_ip_blocked(ip):
+        remaining_time = int((blocked_ips[ip] - time.time()) / 60)
+        log_request(ip, method, url_path, "BLOCKED", f"{remaining_time} minutes remaining")
+        return jsonify({
+            'error': 'IP temporarily blocked',
+            'reason': 'Too many requests detected',
+            'remaining_minutes': remaining_time,
+            'unblock_time': datetime.fromtimestamp(blocked_ips[ip]).strftime('%Y-%m-%d %H:%M:%S')
+        }), 429
+    
+    # Check rate limits
+    allowed, request_count, reason = check_rate_limit(ip)
+    if not allowed:
+        if "DDoS" in reason:
+            log_request(ip, method, url_path, "DDOS_BLOCKED", reason)
+            return jsonify({
+                'error': 'IP blocked due to suspicious activity',
+                'reason': reason,
+                'block_duration_minutes': BLOCK_DURATION_MINUTES
+            }), 429
+        else:
+            log_request(ip, method, url_path, "RATE_LIMITED", f"{request_count}/{REQUESTS_PER_HOUR}")
+            return jsonify({
+                'error': 'Rate limit exceeded',
+                'limit': f"{REQUESTS_PER_HOUR} requests per hour",
+                'current_count': request_count,
+                'reset_in_minutes': 60
+            }), 429
+    
+    return None  # Continue to actual endpoint
 
-@app.route('/health')
-def health():
-    """Health check with basic stats"""
+@app.before_request
+def before_request():
+    """Apply rate limiting to ALL requests"""
+    # Skip rate limiting for proxy admin endpoints
+    if request.path in ['/proxy-health', '/proxy-stats']:
+        return None
+    
+    rate_limit_result = rate_limit_middleware()
+    if rate_limit_result:
+        return rate_limit_result
+
+@app.route('/proxy-health')
+def proxy_health():
+    """Proxy health check (no rate limiting)"""
     cleanup_old_data()
     
     return jsonify({
-        'status': 'healthy',
+        'proxy_status': 'healthy',
         'backend_url': BACKEND_URL,
         'active_ips': len(ip_requests),
         'blocked_ips': len(blocked_ips),
@@ -467,9 +500,9 @@ def health():
         'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     })
 
-@app.route('/stats')
-def get_stats():
-    """Detailed statistics"""
+@app.route('/proxy-stats')
+def proxy_stats():
+    """Detailed proxy statistics (no rate limiting)"""
     cleanup_old_data()
     current_time = time.time()
     
@@ -488,8 +521,7 @@ def get_stats():
     for ip, requests in ip_requests.items():
         ip_usage[ip] = {
             'requests_this_hour': len(requests),
-            'remaining_requests': max(0, REQUESTS_PER_HOUR - len(requests)),
-            'requests_last_minute': sum(1 for t in requests if t > time.time() - 60)
+            'remaining_requests': max(0, REQUESTS_PER_HOUR - len(requests))
         }
     
     return jsonify({
@@ -507,70 +539,30 @@ def get_stats():
 
 @app.route('/unblock/<ip>')
 def unblock_ip(ip):
-    """Manually unblock an IP"""
+    """Manually unblock an IP (no rate limiting)"""
     if ip in blocked_ips:
         del blocked_ips[ip]
-        # Also clear their request history
-        if ip in ip_requests:
-            del ip_requests[f"ip_{ip}"]  # Clear the tracking
         logger.info(f"🔓 MANUALLY UNBLOCKED: {ip}")
         return jsonify({'message': f'IP {ip} has been unblocked', 'success': True})
     else:
         return jsonify({'message': f'IP {ip} was not blocked', 'success': False})
 
-# Main proxy route - handles all requests
+# Main proxy route - handles all requests to backend
+@app.route('/', defaults={'path': ''})
 @app.route('/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'])
 def proxy_request(path=""):
-    """Main proxy function - FIXED VERSION"""
+    """Main proxy function - rate limiting already applied in before_request"""
     ip = get_real_ip()
     method = request.method
     url_path = f"/{path}"
     
-    # Clean old data periodically
-    cleanup_old_data()
-    
-    # FIRST: Check if IP is already blocked
-    if is_ip_blocked(ip):
-        remaining_time = max(0, int((blocked_ips[ip] - time.time()) / 60))
-        log_request(ip, method, url_path, "BLOCKED", f"{remaining_time} minutes remaining")
-        return jsonify({
-            'error': 'IP temporarily blocked',
-            'reason': 'Too many requests detected',
-            'remaining_minutes': remaining_time,
-            'unblock_time': datetime.fromtimestamp(blocked_ips[ip]).strftime('%Y-%m-%d %H:%M:%S')
-        }), 429
-    
-    # SECOND: Check rate limits (this will block if needed)
-    allowed, request_count, reason = check_rate_limit(ip)
-    if not allowed:
-        # This IP just got rate limited or DDoS blocked
-        if "DDoS" in reason:
-            log_request(ip, method, url_path, "DDOS_BLOCKED", reason)
-            return jsonify({
-                'error': 'IP blocked due to suspicious activity',
-                'reason': reason,
-                'block_duration_minutes': BLOCK_DURATION_MINUTES
-            }), 429
-        else:
-            log_request(ip, method, url_path, "RATE_LIMITED", f"{request_count}/{REQUESTS_PER_HOUR}")
-            return jsonify({
-                'error': 'Rate limit exceeded',
-                'limit': f"{REQUESTS_PER_HOUR} requests per hour",
-                'current_count': request_count,
-                'reset_in_minutes': 60
-            }), 429
-    
-    # THIRD: Forward request to backend (only if not blocked/rate limited)
+    # Forward request to backend
     try:
         backend_url = f"{BACKEND_URL.rstrip('/')}/{path}"
         
         # Copy headers (remove problematic ones)
         headers = {k: v for k, v in request.headers.items() 
                   if k.lower() not in ['host', 'content-length']}
-        
-        # Add proxy identification
-        headers['X-Forwarded-For'] = ip
-        headers['X-Proxy-Source'] = 'SecurityProxy'
         
         # Handle different request types
         if method == 'GET':
@@ -600,21 +592,14 @@ def proxy_request(path=""):
                                       data=request.get_data(), params=request.args, timeout=30)
         
         # Log success
+        request_count = len(ip_requests[ip])
         log_request(ip, method, url_path, "SUCCESS", 
                    f"→ Backend {response.status_code} | {request_count}/{REQUESTS_PER_HOUR}")
         
-        # Return response with security headers
+        # Return response
         excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
         response_headers = {k: v for k, v in response.headers.items() 
                           if k.lower() not in excluded_headers}
-        
-        # Add security headers
-        response_headers.update({
-            'X-Content-Type-Options': 'nosniff',
-            'X-Frame-Options': 'SAMEORIGIN',
-            'X-XSS-Protection': '1; mode=block',
-            'Referrer-Policy': 'strict-origin-when-cross-origin'
-        })
         
         return Response(
             response.content,
@@ -656,11 +641,11 @@ if __name__ == '__main__':
     print(f"🚫 Block Duration: {BLOCK_DURATION_MINUTES} minutes")
     print(f"📝 Logs: requests.log")
     print("="*50)
-    print("📋 Endpoints:")
-    print("   /health    - Health check")
-    print("   /stats     - Detailed statistics")  
-    print("   /unblock/<ip> - Unblock IP")
-    print("   /*         - Proxy to backend")
+    print("📋 Proxy Admin Endpoints (no rate limit):")
+    print("   /proxy-health    - Proxy health check")
+    print("   /proxy-stats     - Detailed statistics")  
+    print("   /unblock/<ip>    - Unblock IP")
+    print("📋 All other routes are proxied to backend with rate limiting")
     print("="*50 + "\n")
     
     port = int(os.environ.get('PORT', 8080))
