@@ -112,7 +112,7 @@ def home():
     return jsonify({
         'service': 'API Rate Limiter',
         'status': 'running',
-        'backend_url': BACKEND_URL,
+        # 'backend_url': BACKEND_URL,
         'limits': {
             'requests_per_hour': REQUESTS_PER_HOUR,
             'ddos_threshold': f"{DDOS_REQUESTS_PER_MINUTE}/minute",
@@ -132,7 +132,7 @@ def health():
     
     return jsonify({
         'status': 'healthy',
-        'backend_url': BACKEND_URL,
+        # 'backend_url': BACKEND_URL,
         'active_ips': len(ip_requests),
         'blocked_ips': len(blocked_ips),
         'total_requests': stats.get('total', 0),
@@ -172,7 +172,7 @@ def get_stats():
         'ip_usage': ip_usage,
         'statistics': dict(stats),
         'configuration': {
-            'backend_url': BACKEND_URL,
+            # 'backend_url': BACKEND_URL,
             'requests_per_hour': REQUESTS_PER_HOUR,
             'ddos_threshold': DDOS_REQUESTS_PER_MINUTE,
             'block_duration_minutes': BLOCK_DURATION_MINUTES
